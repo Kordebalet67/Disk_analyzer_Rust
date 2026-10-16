@@ -304,11 +304,11 @@ fn draw_right_text(ui: &mut egui::Ui, width: f32, text: String, color: Color32) 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::hover());
     let pos = rect.right_center() - egui::vec2(2.0, 0.0);
     ui.painter().text(
-        text,
-        Align2::RIGHT_CENTER,
-        pos,
-        FontId::monospace(13.0),
-        color,
+        pos,                      // позиция
+        Align2::RIGHT_CENTER,     // выравнивание
+        text,                     // текст
+        FontId::monospace(13.0),  // шрифт
+        color,                    // цвет
     );
 }
 
@@ -585,7 +585,8 @@ impl eframe::App for App {
                 });
 
             // Применяем запрос на переход в папку
-            if let Some(n) = self.enter_request.lock().unwrap().take() {
+            let n_opt = self.enter_request.lock().unwrap().take();
+            if let Some(n) = n_opt {
                 self.enter_dir(n);
             }
         });
