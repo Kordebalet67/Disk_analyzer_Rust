@@ -1,13 +1,25 @@
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// Константы макета
+// ---------------------------------------------------------------------------
+const NAME_W: f32 = 280.0;
+const SIZE_W: f32 = 90.0;
+const BAR_W: f32 = 160.0;
+const PCT_W: f32 = 55.0;
+const COUNT_W: f32 = 70.0;
+const TYPE_W: f32 = 70.0;
+const COL_GAP: f32 = 10.0;
+const ROW_H: f32 = 20.0;
 
 // ---------------------------------------------------------------------------
 // Модель данных
 // ---------------------------------------------------------------------------
-
 #[derive(Clone)]
 enum Entry {
     File { name: String, size: u64 },
@@ -32,7 +44,6 @@ impl Entry {
     }
 }
 
-#[derive(Clone)]
 struct DirNode {
     name: String,
     path: PathBuf,
@@ -43,106 +54,93 @@ struct DirNode {
 }
 
 // ---------------------------------------------------------------------------
+// Прогресс (атомарный, без локов)
+// ---------------------------------------------------------------------------
+#[derive(Default)]
+struct Progress {
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
+// ---------------------------------------------------------------------------
 // Быстрый параллельный сканер
 // ---------------------------------------------------------------------------
-
-fn scan_tree(path: &Path, progress: &Arc<Mutex<(u64, u64)>>) -> Result<DirNode, String> {
+fn scan_tree(path: &Path, progress: &Arc<Progress>) -> DirNode {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
-    let mut dir_size = 0;
-    let mut dir_count = 0;
     let mut has_error = false;
-    let mut entries = Vec::new();
+    let mut children: Vec<Entry> = Vec::new();
+    let mut dir_paths: Vec<PathBuf> = Vec::new();
 
-    let read_dir = match std::fs::read_dir(path) {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(DirNode {
-                name,
-                path: path.to_path_buf(),
-                size: 0,
-                count: 0,
-                children: vec![],
-                has_error: true,
-            });
+    match std::fs::read_dir(path) {
+        Ok(rd) => {
+            for e in rd {
+                match e {
+                    Ok(e) => {
+                        let p = e.path();
+                        match p.symlink_metadata() {
+                            Ok(meta) => {
+                                let fname = p
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                if meta.is_dir() {
+                                    dir_paths.push(p);
+                                } else {
+                                    let size = meta.len();
+                                    progress.files.fetch_add(1, Ordering::Relaxed);
+                                    progress.bytes.fetch_add(size, Ordering::Relaxed);
+                                    children.push(Entry::File { name: fname, size });
+                                }
+                            }
+                            Err(_) => has_error = true,
+                        }
+                    }
+                    Err(_) => has_error = true,
+                }
+            }
         }
-    };
-
-    // Собираем пути для параллельной обработки
-    let mut paths = Vec::new();
-    for entry in read_dir {
-        match entry {
-            Ok(e) => paths.push(e.path()),
-            Err(_) => has_error = true,
-        }
+        Err(_) => has_error = true,
     }
 
-    // Параллельно сканируем подпапки с помощью Rayon
-    let sub_results: Vec<_> = paths
+    // Параллельная рекурсия по подпапкам
+    let sub_nodes: Vec<DirNode> = dir_paths
         .par_iter()
-        .filter_map(|p| {
-            let meta = p.symlink_metadata().ok()?;
-            if meta.is_dir() {
-                Some((p.clone(), scan_tree(p, progress).ok()?))
-            } else {
-                let size = meta.len();
-                // Атомарно обновляем прогресс
-                let mut prog = progress.lock().unwrap();
-                prog.0 += 1;
-                prog.1 += size;
-                None
-            }
-        })
+        .map(|p| scan_tree(p, progress))
         .collect();
 
-    // Формируем список детей (Rayon сохраняет порядок относительно par_iter)
-    let mut sub_idx = 0;
-    for p in &paths {
-        if let Ok(meta) = p.symlink_metadata() {
-            let fname = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-
-            if meta.is_dir() {
-                if let Some((_, node)) = sub_results.get(sub_idx) {
-                    if p == &node.path {
-                        dir_size += node.size;
-                        dir_count += node.count;
-                        has_error |= node.has_error;
-                        entries.push(Entry::Dir(Arc::new(node.clone())));
-                        sub_idx += 1;
-                    }
-                }
-            } else {
-                let size = meta.len();
-                dir_size += size;
-                dir_count += 1;
-                entries.push(Entry::File { name: fname, size });
-            }
-        }
+    for node in sub_nodes {
+        has_error |= node.has_error;
+        children.push(Entry::Dir(Arc::new(node)));
     }
 
-    // Сортируем по убыванию размера
-    entries.sort_by(|a, b| b.size().cmp(&a.size()));
+    let mut total_size = 0u64;
+    let mut total_count = 0u64;
+    for c in &children {
+        total_size += c.size();
+        match c {
+            Entry::Dir(d) => total_count += d.count,
+            Entry::File { .. } => total_count += 1,
+        }
+    }
+    children.sort_by(|a, b| b.size().cmp(&a.size()));
 
-    Ok(DirNode {
+    DirNode {
         name,
         path: path.to_path_buf(),
-        size: dir_size,
-        count: dir_count,
-        children: entries,
+        size: total_size,
+        count: total_count,
+        children,
         has_error,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Утилиты
+// Утилиты форматирования
 // ---------------------------------------------------------------------------
-
 fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["Б", "КБ", "МБ", "ГБ", "ТБ", "ПБ"];
     let mut size = bytes as f64;
@@ -170,187 +168,216 @@ fn fmt_int(n: u64) -> String {
     res.chars().rev().collect()
 }
 
+fn reveal_path(path: &Path, is_dir: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        if is_dir {
+            let _ = open::that(path);
+        } else {
+            std::process::Command::new("explorer")
+                .arg("/select,")
+                .arg(path)
+                .spawn()
+                .ok();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if is_dir {
+            let _ = open::that(path);
+        } else {
+            std::process::Command::new("open").arg("-R").arg(path).spawn().ok();
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = if is_dir {
+            path.to_path_buf()
+        } else {
+            path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.to_path_buf())
+        };
+        let _ = open::that(target);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Состояние приложения
 // ---------------------------------------------------------------------------
-
 struct App {
     root_node: Option<Arc<DirNode>>,
     stack: Vec<Arc<DirNode>>,
+    view_entries: Vec<Entry>,
+    view_dirty: bool,
     sort_by_name: bool,
     scanning: bool,
-    scan_progress: Arc<Mutex<(u64, u64)>>,
+    scan_progress: Arc<Progress>,
     scan_start: Option<Instant>,
-    scan_error: Option<String>,
+    result: Arc<Mutex<Option<DirNode>>>,
+    enter_request: Arc<Mutex<Option<Arc<DirNode>>>>,
     display_limit: usize,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            root_node: None,
-            stack: Vec::new(),
-            sort_by_name: false,
-            scanning: false,
-            scan_progress: Arc::new(Mutex::new((0, 0))),
-            scan_start: None,
-            scan_error: None,
-            display_limit: 5000,
-        }
-    }
-}
-
-impl App {
-    fn current_dir(&self) -> Option<&Arc<DirNode>> {
-        self.stack.last()
-    }
-
-    fn go_up(&mut self) {
-        if self.stack.len() > 1 {
-            self.stack.pop();
-        }
-    }
-
-    fn jump_to(&mut self, idx: usize) {
-        if idx < self.stack.len() {
-            self.stack.truncate(idx + 1);
-        }
-    }
-
-    fn enter_dir(&mut self, node: Arc<DirNode>) {
-        self.stack.push(node);
-    }
-
-    fn start_scan(&mut self, path: PathBuf) {
-        self.scanning = true;
-        self.scan_error = None;
-        self.scan_start = Some(Instant::now());
-        *self.scan_progress.lock().unwrap() = (0, 0);
-
-        let progress = self.scan_progress.clone();
-        
-        // Запускаем сканирование в фоновом потоке
-        std::thread::spawn(move || {
-            match scan_tree(&path, &progress) {
-                Ok(node) => {
-                    // Используем канал или глобальное состояние? 
-                    // В eframe проще передать результат через Arc<Mutex<Option>>
-                    // Но мы можем использовать custom event или просто поллить.
-                    // Для простоты сохраним во временный файл? Нет.
-                    // Сделаем через статическую переменную для примера, 
-                    // но лучше добавить поле в App.
-                    
-                    // Мы передадим результат через тот же progress mutex,
-                    // заменив его на более сложную структуру, ИЛИ
-                    // просто добавим поле в App.
-                    // Так как egui immediate mode, добавим Arc<Mutex<Option<DirNode>>>
-                }
-                Err(e) => {}
-            }
-        });
-    }
-}
-
-// Чтобы передать результат из потока, расширим App
-struct AppState {
-    result: Arc<Mutex<Option<Result<DirNode, String>>>>,
-}
-
-impl App {
-    fn trigger_scan(&mut self, ctx: &egui::Context) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.scanning = true;
-            self.scan_error = None;
-            self.scan_start = Some(Instant::now());
-            *self.scan_progress.lock().unwrap() = (0, 0);
-            
-            let progress = self.scan_progress.clone();
-            let result_store = self.result.clone();
-            let ctx_clone = ctx.clone();
-
-            std::thread::spawn(move || {
-                let res = scan_tree(&path, &progress);
-                *result_store.lock().unwrap() = Some(res);
-                // Будим UI поток, чтобы он заметил результат
-                ctx_clone.request_repaint();
-            });
-        }
-    }
-}
-
-// Переопределим Default с учетом нового поля
 impl App {
     fn new() -> Self {
         Self {
             root_node: None,
             stack: Vec::new(),
+            view_entries: Vec::new(),
+            view_dirty: false,
             sort_by_name: false,
             scanning: false,
-            scan_progress: Arc::new(Mutex::new((0, 0))),
+            scan_progress: Arc::new(Progress::default()),
             scan_start: None,
-            scan_error: None,
-            display_limit: 5000,
             result: Arc::new(Mutex::new(None)),
+            enter_request: Arc::new(Mutex::new(None)),
+            display_limit: 5000,
+        }
+    }
+
+    fn current_dir(&self) -> Option<&Arc<DirNode>> {
+        self.stack.last()
+    }
+
+    fn rebuild_view(&mut self) {
+        if let Some(dir) = self.current_dir() {
+            let mut v = dir.children.clone();
+            if self.sort_by_name {
+                v.sort_by(|a, b| {
+                    b.is_dir()
+                        .cmp(&a.is_dir())
+                        .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
+                });
+            }
+            self.view_entries = v;
+        } else {
+            self.view_entries.clear();
+        }
+        self.view_dirty = false;
+    }
+
+    fn enter_dir(&mut self, n: Arc<DirNode>) {
+        self.stack.push(n);
+        self.view_dirty = true;
+    }
+
+    fn go_up(&mut self) {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+            self.view_dirty = true;
+        }
+    }
+
+    fn jump_to(&mut self, i: usize) {
+        if i < self.stack.len() {
+            self.stack.truncate(i + 1);
+            self.view_dirty = true;
+        }
+    }
+
+    fn trigger_scan(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.root_node = None;
+            self.stack.clear();
+            self.view_entries.clear();
+            self.view_dirty = false;
+            self.scanning = true;
+            self.scan_start = Some(Instant::now());
+            self.scan_progress = Arc::new(Progress::default());
+
+            let progress = self.scan_progress.clone();
+            let result = self.result.clone();
+            let ctx2 = ctx.clone();
+
+            std::thread::spawn(move || {
+                let node = scan_tree(&path, &progress);
+                *result.lock().unwrap() = Some(node);
+                ctx2.request_repaint();
+            });
         }
     }
 }
 
-// Удалим старый Default и используем new()
-
 // ---------------------------------------------------------------------------
-// Отрисовка GUI (Immediate Mode)
+// GUI
 // ---------------------------------------------------------------------------
+fn draw_right_text(ui: &mut egui::Ui, width: f32, text: String, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::hover());
+    let pos = rect.right_center() - egui::vec2(2.0, 0.0);
+    ui.painter().text(
+        text,
+        Align2::RIGHT_CENTER,
+        pos,
+        FontId::monospace(13.0),
+        color,
+    );
+}
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Проверяем, завершилось ли сканирование
+        // --- Завершение сканирования ---
         if self.scanning {
-            let mut res_lock = self.result.lock().unwrap();
-            if let Some(res) = res_lock.take() {
+            let mut r = self.result.lock().unwrap();
+            if let Some(node) = r.take() {
+                drop(r);
                 self.scanning = false;
-                match res {
-                    Ok(node) => {
-                        let arc_node = Arc::new(node);
-                        self.root_node = Some(arc_node.clone());
-                        self.stack.clear();
-                        self.stack.push(arc_node);
-                    }
-                    Err(e) => {
-                        self.scan_error = Some(e);
-                    }
-                }
+                let arc = Arc::new(node);
+                self.root_node = Some(arc.clone());
+                self.stack.clear();
+                self.stack.push(arc);
+                self.view_dirty = true;
             } else {
-                // Просим перерисовать через 100мс для обновления прогресса
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                drop(r);
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
 
-        // Стилизация
-        let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-        ctx.set_style(style);
+        // --- Горячие клавиши ---
+        let mut open_req = false;
+        let mut up_req = false;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::CTRL, egui::Key::O) {
+                open_req = true;
+            }
+            if i.key_pressed(egui::Key::Backspace) {
+                up_req = true;
+            }
+            if i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft) {
+                up_req = true;
+            }
+        });
+        if open_req && !self.scanning {
+            self.trigger_scan(ctx);
+        }
+        if up_req {
+            self.go_up();
+        }
 
+        if self.view_dirty {
+            self.rebuild_view();
+        }
+
+        // --- Верхняя панель ---
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📁 Открыть папку…").clicked() && !self.scanning {
+                if ui.button("Открыть папку…").clicked() && !self.scanning {
                     self.trigger_scan(ctx);
                 }
-                
                 let can_up = self.stack.len() > 1 && !self.scanning;
-                if ui.add_enabled(can_up, egui::Button::new("⬆ Вверх")).clicked() {
+                if ui.add_enabled(can_up, egui::Button::new("Вверх")).clicked() {
                     self.go_up();
                 }
-
                 if self.scanning {
                     ui.spinner();
-                    let (files, bytes) = *self.scan_progress.lock().unwrap();
+                    let files = self.scan_progress.files.load(Ordering::Relaxed);
+                    let bytes = self.scan_progress.bytes.load(Ordering::Relaxed);
+                    let elapsed = self.scan_start.map(|s| s.elapsed().as_secs()).unwrap_or(0);
                     ui.label(format!(
-                        "Сканирование… файлов: {} • {}",
+                        "Сканирование… файлов: {} • {} • {} с",
                         fmt_int(files),
-                        human_size(bytes)
+                        human_size(bytes),
+                        elapsed
                     ));
                 }
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(dir) = self.current_dir() {
                         ui.label(RichText::new(human_size(dir.size)).strong());
@@ -360,29 +387,29 @@ impl eframe::App for App {
 
             // Хлебные крошки
             ui.horizontal_wrapped(|ui| {
-                for (i, node) in self.stack.iter().enumerate() {
+                let len = self.stack.len();
+                for i in 0..len {
                     if i > 0 {
                         ui.label("›");
                     }
-                    let is_last = i == self.stack.len() - 1;
-                    let text = if node.name.len() > 25 {
-                        format!("{}…", &node.name[..24])
+                    let node = self.stack[i].clone();
+                    let text = if node.name.chars().count() > 25 {
+                        let s: String = node.name.chars().take(24).collect();
+                        format!("{}…", s)
                     } else {
                         node.name.clone()
                     };
-                    
-                    if is_last {
+                    if i == len - 1 {
                         ui.label(RichText::new(text).strong());
-                    } else {
-                        if ui.link(text).clicked() {
-                            self.jump_to(i);
-                        }
+                    } else if ui.link(text).clicked() {
+                        self.jump_to(i);
                     }
                 }
             });
             ui.separator();
         });
 
+        // --- Нижняя панель ---
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(dir) = self.current_dir() {
@@ -400,167 +427,166 @@ impl eframe::App for App {
             });
         });
 
-        // Центральная панель со списком
+        // --- Центральная панель ---
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.root_node.is_none() && !self.scanning {
+            if self.root_node.is_none() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
+                    ui.add_space(80.0);
                     ui.heading("DiskAnalyzer");
-                    ui.label("Нажмите «Открыть папку…» для начала анализа");
+                    if self.scanning {
+                        ui.spinner();
+                        ui.label("Сканирование…");
+                    } else {
+                        ui.label("Нажмите «Открыть папку…» (Ctrl+O) для начала анализа");
+                    }
                 });
                 return;
             }
+
+            let text_color = ui.visuals().text_color();
+            let secondary = Color32::from_gray(120);
+
+            // Заголовок таблицы
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = COL_GAP;
+                let name_txt = if self.sort_by_name { "Имя ▲" } else { "Имя" };
+                if ui.add_sized([NAME_W, ROW_H], egui::Button::new(name_txt)).clicked() {
+                    self.sort_by_name = true;
+                    self.view_dirty = true;
+                }
+                let size_txt = if !self.sort_by_name { "Размер ▼" } else { "Размер" };
+                if ui.add_sized([SIZE_W, ROW_H], egui::Button::new(size_txt)).clicked() {
+                    self.sort_by_name = false;
+                    self.view_dirty = true;
+                }
+                ui.add_sized([BAR_W, ROW_H], egui::Label::new("Доля"));
+                draw_right_text(ui, PCT_W, "%".to_string(), secondary);
+                draw_right_text(ui, COUNT_W, "Файлов".to_string(), secondary);
+                ui.add_sized([TYPE_W, ROW_H], egui::Label::new("Тип"));
+            });
+            ui.separator();
 
             let dir = match self.current_dir() {
                 Some(d) => d.clone(),
                 None => return,
             };
+            let total_size = dir.size.max(1) as f64;
 
-            // Заголовки таблицы
-            ui.horizontal(|ui| {
-                let name_btn = ui.selectable_label(!self.sort_by_name, "Имя ▼"); // упрощенно
-                if ui.button(if self.sort_by_name { "Имя ▲" } else { "Имя" }).clicked() {
-                    self.sort_by_name = true;
-                }
-                if ui.button(if !self.sort_by_name { "Размер ▼" } else { "Размер" }).clicked() {
-                    self.sort_by_name = false;
-                }
-                ui.label("Доля");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("Тип      ");
-                    ui.label("Файлов   ");
-                });
-            });
-            ui.separator();
-
-            // Скроллируемый список
-            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                let total_size = dir.size.max(1) as f64;
-                
-                // Сортировка
-                let mut children = dir.children.clone();
-                if self.sort_by_name {
-                    children.sort_by(|a, b| {
-                        a.is_dir().cmp(&b.is_dir()).reverse()
-                            .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
-                    });
-                } else {
-                    children.sort_by(|a, b| b.size().cmp(&a.size()));
-                }
-
-                let limit = children.len().min(self.display_limit);
-                
-                for item in children.iter().take(limit) {
-                    let is_dir = item.is_dir();
-                    let size = item.size();
-                    let frac = size as f64 / total_size;
-                    let pct = frac * 100.0;
-
-                    ui.horizontal(|ui| {
-                        // Имя (кликабельное для папок)
-                        let name_text = item.name();
-                        let name_widget = if is_dir {
-                            let resp = ui.link(RichText::new(name_text).color(Color32::from_rgb(30, 100, 220)));
-                            if resp.clicked() {
-                                if let Entry::Dir(node) = item {
-                                    self.enter_dir(node.clone());
-                                }
-                            }
-                            if resp.double_clicked() {
-                                if let Entry::Dir(node) = item {
-                                    self.enter_dir(node.clone());
-                                }
-                            }
-                            resp
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    let limit = self.view_entries.len().min(self.display_limit);
+                    for (i, item) in self.view_entries.iter().enumerate().take(limit) {
+                        let is_dir = item.is_dir();
+                        let size = item.size();
+                        let frac = size as f64 / total_size;
+                        let pct = frac * 100.0;
+                        let fill_color = if i % 2 == 1 {
+                            Color32::from_gray(246)
                         } else {
-                            ui.label(name_text)
+                            Color32::TRANSPARENT
                         };
 
-                        // Контекстное меню
-                        name_widget.context_menu(|ui| {
-                            if ui.button("Открыть").clicked() {
-                                let _ = open::that(&item.name()); // упрощение
-                                ui.close_menu();
-                            }
-                            if ui.button("Показать в папке").clicked() {
-                                let path = dir.path.join(item.name());
-                                #[cfg(target_os = "windows")]
-                                {
-                                    std::process::Command::new("explorer")
-                                        .args(["/select,", path.to_str().unwrap_or("")])
-                                        .spawn().ok();
+                        let full = dir.path.join(item.name());
+                        let dir_node_opt: Option<Arc<DirNode>> = match item {
+                            Entry::Dir(d) => Some(d.clone()),
+                            _ => None,
+                        };
+                        let enter_req = self.enter_request.clone();
+                        let enter_req_menu = enter_req.clone();
+                        let dir_node_menu = dir_node_opt.clone();
+                        let full_menu = full.clone();
+
+                        egui::Frame::none().fill(fill_color).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = COL_GAP;
+
+                                // Имя
+                                let name_resp = if is_dir {
+                                    let txt = RichText::new(item.name()).color(Color32::from_rgb(40, 110, 220));
+                                    ui.add_sized([NAME_W, ROW_H], egui::Label::new(txt).sense(Sense::click()).truncate())
+                                } else {
+                                    ui.add_sized([NAME_W, ROW_H], egui::Label::new(item.name()).truncate())
+                                };
+                                if is_dir && name_resp.clicked() {
+                                    if let Some(n) = &dir_node_opt {
+                                        *enter_req.lock().unwrap() = Some(n.clone());
+                                    }
                                 }
-                                #[cfg(not(target_os = "windows"))]
-                                {
-                                    let _ = open::that(path.parent().unwrap_or(&path));
+
+                                // Контекстное меню
+                                name_resp.context_menu(move |ui| {
+                                    if ui.button("Открыть").clicked() {
+                                        if let Some(n) = &dir_node_menu {
+                                            *enter_req_menu.lock().unwrap() = Some(n.clone());
+                                        } else {
+                                            let _ = open::that(&full_menu);
+                                        }
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Показать в папке").clicked() {
+                                        reveal_path(&full_menu, is_dir);
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Копировать путь").clicked() {
+                                        let s = full_menu.display().to_string();
+                                        ui.ctx().output_mut(|o| o.copied_text = s);
+                                        ui.close_menu();
+                                    }
+                                });
+
+                                // Размер
+                                draw_right_text(ui, SIZE_W, human_size(size), text_color);
+
+                                // Полоса доли
+                                let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(BAR_W, 14.0), Sense::hover());
+                                ui.painter().rect_filled(bar_rect, 3.0, Color32::from_gray(225));
+                                let fw = (bar_rect.width() * frac as f32).min(bar_rect.width());
+                                if fw > 0.5 {
+                                    let mut fr = bar_rect;
+                                    fr.set_width(fw);
+                                    ui.painter().rect_filled(fr, 3.0, Color32::from_rgb(70, 130, 230));
                                 }
-                                ui.close_menu();
-                            }
-                            if ui.button("Копировать путь").clicked() {
-                                let path = dir.path.join(item.name());
-                                ui.output_mut(|o| o.copied_text = path.display().to_string());
-                                ui.close_menu();
-                            }
+
+                                // Процент
+                                draw_right_text(ui, PCT_W, format!("{:.1}%", pct), text_color);
+
+                                // Кол-во файлов
+                                let cnt = match item {
+                                    Entry::Dir(d) => fmt_int(d.count),
+                                    _ => "—".to_string(),
+                                };
+                                draw_right_text(ui, COUNT_W, cnt, secondary);
+
+                                // Тип
+                                let kind = if is_dir {
+                                    "Папка".to_string()
+                                } else {
+                                    Path::new(item.name())
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .map(|e| e.to_uppercase())
+                                        .unwrap_or_else(|| "ФАЙЛ".into())
+                                };
+                                ui.add_sized([TYPE_W, ROW_H], egui::Label::new(kind).truncate());
+                            });
                         });
+                    }
 
-                        // Размер
-                        ui.label(RichText::new(human_size(size)).monospace());
-
-                        // Полоса доли (прогресс-бар)
-                        let bar_width = 150.0;
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_width, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, Color32::from_gray(230));
-                        let fill_width = (rect.width() * frac as f32).min(rect.width());
-                        if fill_width > 0.0 {
-                            let mut fill_rect = rect;
-                            fill_rect.set_width(fill_width);
-                            ui.painter().rect_filled(fill_rect, 2.0, Color32::from_rgb(70, 130, 230));
-                        }
-                        ui.label(format!("{:.1}%", pct));
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Тип
-                            let kind = if is_dir {
-                                "Папка".to_string()
-                            } else {
-                                Path::new(item.name())
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .map(|e| e.to_uppercase())
-                                    .unwrap_or_else(|| "ФАЙЛ".to_string())
-                            };
-                            ui.label(kind);
-
-                            // Кол-во файлов
-                            if let Entry::Dir(d) = item {
-                                ui.label(fmt_int(d.count));
-                            } else {
-                                ui.label("—");
-                            }
+                    if self.view_entries.len() > limit {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(format!(
+                                "… показаны {} крупнейших из {}",
+                                limit,
+                                self.view_entries.len()
+                            ));
                         });
-                    });
-                    
-                    // Разделитель строк (зебра)
-                    ui.separator();
-                }
+                    }
+                });
 
-                if children.len() > limit {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(format!("… показаны {} крупнейших из {}", limit, children.len()));
-                    });
-                }
-            });
-        });
-
-        // Горячие клавиши
-        ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::CTRL, egui::Key::O) {
-                if !self.scanning {
-                    self.trigger_scan(ctx);
-                }
-            }
-            if i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::ArrowLeft) && i.modifiers.alt {
-                self.go_up();
+            // Применяем запрос на переход в папку
+            if let Some(n) = self.enter_request.lock().unwrap().take() {
+                self.enter_dir(n);
             }
         });
     }
@@ -569,7 +595,6 @@ impl eframe::App for App {
 // ---------------------------------------------------------------------------
 // Точка входа
 // ---------------------------------------------------------------------------
-
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -578,7 +603,6 @@ fn main() -> eframe::Result<()> {
             .with_title("DiskAnalyzer"),
         ..Default::default()
     };
-
     eframe::run_native(
         "DiskAnalyzer",
         options,
